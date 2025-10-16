@@ -5,9 +5,10 @@ Network monitor (no scapy, no psutil) — adds:
  - TCP stream reassembly (basic, seq-based)
  - inode->pid cache with TTL expiry
  - /proc monitoring with inotify (via ctypes) fallback to polling
+ - NEW: --no-ui mode (plain text output, suitable for tee / log files)
 
 Usage:
-    sudo python3 network_monitor_no_deps_plus_v2.py [--proto ...] [--port ...] [--export-json f] [--export-csv f]
+    sudo python3 network_monitor_no_deps_plus_v2.py [--proto ...] [--port ...] [--export-json f] [--export-csv f] [--no-ui]
 
 Notes:
  - Run as root (raw socket + /proc watch)
@@ -15,6 +16,7 @@ Notes:
 """
 
 import os
+import sys
 import socket
 import struct
 import threading
@@ -55,7 +57,7 @@ pid_seen = set()
 
 PacketInfo = namedtuple("PacketInfo", ["ts","proto","src","sport","dst","dport","size","pid","pname","info"])
 
-# ---------- /proc parsing helpers (same as before) ----------
+# ---------- /proc parsing helpers ----------
 def hex_to_ipv4(hexstr):
     try:
         b = bytes.fromhex(hexstr)
@@ -197,16 +199,11 @@ def build_conn_map_from_cache():
     return conn_map
 
 # ---------- attempt to use inotify via ctypes ----------
-# We'll watch /proc for PID creation/deletion and optionally /proc/<pid>/fd changes.
 has_inotify = False
 libc = None
 inotify_fd = None
 IN_CREATE = 0x00000100
 IN_DELETE = 0x00000200
-IN_ATTRIB = 0x00000004
-IN_MODIFY = 0x00000002
-IN_MOVED_TO = 0x00000080
-IN_MOVED_FROM = 0x00000040
 
 def try_setup_inotify():
     global has_inotify, libc, inotify_fd
@@ -272,7 +269,7 @@ def parse_arp(data):
     except Exception:
         return None
 
-# ---------- DNS parsing (same helper as before) ----------
+# ---------- DNS parsing ----------
 def decode_dns_name(buf, offset):
     labels=[]; orig_off = offset; jumped=False; max_steps=256; steps=0
     while True:
@@ -321,14 +318,10 @@ def parse_dns_from_payload(payload, is_tcp=False):
         return qnames
 
 # ---------- TCP reassembly (basic) ----------
-# We'll keep per-connection dict:
-# key: (ip1,port1,ip2,port2) canonicalized (lowest tuple first) with direction mapping
-# value: {"a_to_b": {seq:payload_bytes}, "b_to_a": {seq:payload_bytes}, "next_seq_a":None, "next_seq_b":None}
 tcp_streams = {}
 tcp_lock = threading.Lock()
 
 def canonical_conn(src, sport, dst, dport):
-    # canonical form independent of direction
     t1 = (src, int(sport or 0))
     t2 = (dst, int(dport or 0))
     if t1 <= t2:
@@ -346,52 +339,40 @@ def add_tcp_segment(src, sport, dst, dport, seq, payload):
         if entry is None:
             entry = {"a_to_b":{}, "b_to_a":{}, "a_id":(key[0],int(key[1]) if key[1] else 0), "b_id":(key[2],int(key[3]) if key[3] else 0), "assembled_a":b"", "assembled_b":b""}
             tcp_streams[key] = entry
-        # which direction?
         if dir_flag == entry["a_id"]:
             bag = entry["a_to_b"]
             side = "a"
         else:
             bag = entry["b_to_a"]
             side = "b"
-        # store segment
         if len(b"".join(bag.values())) + len(payload) > TCP_REASM_LIMIT:
-            # limit reached — drop oldest
             bag.clear()
-        # allow duplicate seq keys; prefer first
         if seq not in bag:
             bag[seq] = payload
-        # attempt to assemble contiguous data starting from min seq
         try:
-            # assemble by sorting seqs and concatenating contiguous runs
             seqs = sorted(bag.keys())
-            assembled = b""
-            cur = seqs[0]
             assembled_chunks = []
+            cur = seqs[0]
             for s in seqs:
                 if s == cur:
                     assembled_chunks.append(bag[s])
                     cur = s + len(bag[s])
                 elif s < cur:
-                    # overlap: use part after cur
                     off = cur - s
                     if off < len(bag[s]):
                         assembled_chunks.append(bag[s][off:])
                         cur = s + len(bag[s])
                 else:
-                    # gap -> stop assembly
                     break
             assembled = b"".join(assembled_chunks)
-            # store into assembled side buffer (append)
             if side == "a":
                 entry["assembled_a"] += assembled
             else:
                 entry["assembled_b"] += assembled
-            # remove used sequences
             used_end = cur
             to_del = [s for s in bag if s < used_end]
             for s in to_del:
                 bag.pop(s, None)
-            # return assembled bytes (limit to reasonable)
             if assembled:
                 return assembled[:65536]
         except Exception:
@@ -443,16 +424,13 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
             proto_name="tcp"
             if tcp:
                 sport=tcp["sport"]; dport=tcp["dport"]
-                # try reassembly
                 seg = add_tcp_segment(src,sport,dst,dport,tcp["seq"], tcp["payload"])
                 if seg and (sport==80 or dport==80 or sport==53 or dport==53):
-                    # attempt to extract first-line HTTP or DNS over TCP
                     try:
                         txt = seg.decode(errors="ignore")
                         if txt.startswith("GET ") or txt.startswith("POST ") or "HTTP/" in txt.splitlines()[0]:
                             info = txt.splitlines()[0][:120]
                         else:
-                            # DNS over TCP parse
                             if sport==53 or dport==53:
                                 q = parse_dns_from_payload(seg, is_tcp=True)
                                 if q: info = ",".join(q[:2])
@@ -463,7 +441,6 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
             proto_name="udp"
             if udp:
                 sport=udp["sport"]; dport=udp["dport"]
-                # DNS UDP quick parse
                 if sport==53 or dport==53:
                     q= parse_dns_from_payload(udp["payload"], is_tcp=False)
                     if q: info = ",".join(q[:2])
@@ -474,7 +451,7 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
         else:
             proto_name=f"ip/{ip['proto']}"
     elif ethertype==0x86DD:
-        ip6 = parse_ipv6(payload)
+        ip6 = parse_ipv6(payload); 
         if not ip6: return
         src=ip6["src"]; dst=ip6["dst"]; proto_name=f"ipv6/{ip6['proto']}"
     elif ethertype==0x0806:
@@ -499,7 +476,6 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
     # mapping to pid
     pid=None; pname=None
     conn_map = conn_map_getter()
-    # key matching for tcp/udp
     key = (src, sport, dst, dport, "tcp" if proto_name=="tcp" else ("udp" if proto_name=="udp" else None))
     rev = (dst, dport, src, sport, key[4])
     if key in conn_map and conn_map[key]:
@@ -507,7 +483,6 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
     elif rev in conn_map and conn_map[rev]:
         pid = conn_map[rev]
     else:
-        # best-effort match by addr+proto
         for k,v in conn_map.items():
             try:
                 if key[4] and k[4]==key[4] and (k[0]==src or k[2]==dst):
@@ -515,7 +490,6 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
             except Exception:
                 continue
     if pid:
-        # refresh inode timestamp done in build_conn_map_from_cache()
         try:
             pname = open(f"/proc/{pid}/comm").read().strip()
         except Exception:
@@ -557,45 +531,61 @@ def packet_sniffer_thread(filter_proto, filter_port, packets_deque, stats, conn_
 
 # ---------- conn refresher with inotify fallback ----------
 def conn_refresher(holder):
-    # try inotify
     inited = False
     if USE_INOTIFY:
         try:
             inited = try_setup_inotify()
         except Exception:
             inited = False
-    # initial population
     incremental_inode_pid_update()
     holder[0] = build_conn_map_from_cache()
     last_poll = time.time()
     BUF_LEN = 4096
     if inited and has_inotify:
-        # read events from inotify fd
         while RUNNING:
             try:
-                # read non-blocking
                 data = os.read(inotify_fd, BUF_LEN)
-                # any change -> update incrementally
                 incremental_inode_pid_update()
                 expire_inode_entries()
                 holder[0] = build_conn_map_from_cache()
             except BlockingIOError:
                 time.sleep(0.2)
             except Exception:
-                # fallback to polling
                 time.sleep(0.2)
-            # expire TTL occasionally
             if time.time() - last_poll > REFRESH_CONN:
                 expire_inode_entries()
                 holder[0] = build_conn_map_from_cache()
                 last_poll = time.time()
     else:
-        # polling fallback (incremental)
         while RUNNING:
             incremental_inode_pid_update()
             expire_inode_entries()
             holder[0] = build_conn_map_from_cache()
             time.sleep(REFRESH_CONN)
+
+# ---------- Text console logger (no-ui mode) ----------
+def console_logger(packets_deque, stats):
+    """
+    Print human-readable lines to stdout. Suitable for piping / tee.
+    Consumes packets from deque (popleft) to avoid UI-only duplication.
+    """
+    try:
+        while RUNNING:
+            try:
+                pkt = packets_deque.popleft()
+            except IndexError:
+                time.sleep(0.1)
+                continue
+            t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(pkt.ts))
+            src_port = f":{pkt.sport}" if pkt.sport else ""
+            dst_port = f":{pkt.dport}" if pkt.dport else ""
+            pid_part = f"{pkt.pid}/{pkt.pname}" if pkt.pid else "-"
+            info_part = f" {pkt.info}" if pkt.info else ""
+            line = f"[{t}] {pkt.proto.upper():5} {pkt.src}{src_port} -> {pkt.dst}{dst_port} {pkt.size}B PID={pid_part}{info_part}"
+            # print plain text, flush immediately
+            print(line, flush=True)
+    except KeyboardInterrupt:
+        pass
 
 # ---------- Curses UI ----------
 def ui(stdscr, packets, stats, conn_map_holder):
@@ -643,6 +633,7 @@ def main():
     parser.add_argument("--port", default=None)
     parser.add_argument("--export-json", default=None)
     parser.add_argument("--export-csv", default=None)
+    parser.add_argument("--no-ui", action="store_true", help="Disable curses UI and print plain text lines (suitable for tee/logging)")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -651,7 +642,6 @@ def main():
 
     packets = deque(maxlen=MAX_RECENT)
     stats = {"total_pkts":0,"total_bytes":0,"by_pid_bytes":defaultdict(int),"by_pid_pkts":defaultdict(int)}
-    # initialize inode cache
     incremental_inode_pid_update()
     conn_holder = [build_conn_map_from_cache()]
     exporter = None
@@ -664,9 +654,14 @@ def main():
     t_sniff.start()
 
     try:
-        curses.wrapper(ui, packets, stats, conn_holder)
+        if args.no_ui:
+            # start console logger in main thread (so prints go to stdout nicely)
+            console_logger(packets, stats)
+        else:
+            curses.wrapper(ui, packets, stats, conn_holder)
     except Exception as e:
-        print("UI error:", e)
+        # In no-ui mode, exceptions still should be printed plainly
+        print("UI/Runtime error:", e, file=sys.stderr)
 
     time.sleep(0.2)
     print("Stopping...")
