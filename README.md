@@ -124,7 +124,7 @@ Ne capture pas le trafic crypté (HTTPS) — seules les métadonnées (IP/port) 
 
 Exécuter et rediriger la sortie dans un fichier log :
 
-# " sudo python3 monitor.py | tee live_network.log "
+" sudo python3 monitor.py | tee live_network.log "
 
 Filtrer un protocole spécifique (ex. DNS uniquement) :
 
