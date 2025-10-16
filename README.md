@@ -27,12 +27,12 @@
 
 2️⃣ Cloner ou copier le script
 
-# " git clone https://github.com/votreuser/network-process-monitor
-# cd network-process-monitor "
+" git clone https://github.com/votreuser/network-process-monitor
+ cd network-process-monitor "
 
 3️⃣ Exécuter le programme
 
-# " sudo python3 net_monitor.py "
+" sudo python3 net_monitor.py "
 
 
 ⚠️ L’utilisation de sudo est obligatoire car le socket brut (AF_PACKET) nécessite des privilèges root.
@@ -43,7 +43,7 @@
 
     Le script crée un socket brut :
 
-# " socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3)) "
+" socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(3)) "
 
 Cela permet de recevoir tous les paquets réseau avant traitement par le noyau.
 
@@ -128,4 +128,4 @@ Exécuter et rediriger la sortie dans un fichier log :
 
 Filtrer un protocole spécifique (ex. DNS uniquement) :
 
-# " sudo python3 monitor.py --filter dns "
+" sudo python3 monitor.py --filter dns "
