@@ -27,8 +27,8 @@
 
 2️⃣ Cloner ou copier le script
 
-" git clone https://github.com/Maik-start/network-process-monitor
- cd network-process-monitor "
+""" git clone https://github.com/Maik-start/network-process-monitor
+ cd network-process-monitor """
 
 3️⃣ Exécuter le programme
 
