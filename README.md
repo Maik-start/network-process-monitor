@@ -129,3 +129,15 @@ Exécuter et rediriger la sortie dans un fichier log :
 Filtrer un protocole spécifique (ex. DNS uniquement) :
 
 " sudo python3 monitor.py --filter dns "
+
+Capture silencieuse, export JSON :
+"sudo python3 net_monitor.py --background-log --export-json logs.json"
+
+Capture silencieuse, export CSV :
+"sudo python3 net_monitor.py --background-log --export-csv logs.csv"
+
+Capture et affichage console :
+"sudo python3 net_monitor.py --no-ui"
+
+Capture avec interface curses (par défaut) :
+"sudo python3 net_monitor.py"
