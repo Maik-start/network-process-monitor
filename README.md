@@ -141,3 +141,10 @@ Capture et affichage console :
 
 Capture avec interface curses (par défaut) :
 "sudo python3 net_monitor.py"
+
+Background, send JSON to syslog (view with journalctl) :
+sudo python3 net_monitor.py --background-log --syslog
+sudo journalctl -f -t netmon
+
+Both file + syslog:
+sudo python3 net_monitor.py --background-log --export-json logs.json --syslog
