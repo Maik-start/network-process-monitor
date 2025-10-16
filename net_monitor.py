@@ -1,51 +1,51 @@
 #!/usr/bin/env python3
 """
 network_monitor_no_deps_plus_v2.py
-Network monitor (no scapy, no psutil) — adds:
+
+Network monitor (no scapy, no psutil)
+
+Features:
  - TCP stream reassembly (basic, seq-based)
  - inode->pid cache with TTL expiry
  - /proc monitoring with inotify (via ctypes) fallback to polling
- - NEW: --no-ui mode (plain text output, suitable for tee / log files)
-
-Usage:
-    sudo python3 network_monitor_no_deps_plus_v2.py [--proto ...] [--port ...] [--export-json f] [--export-csv f] [--no-ui]
-
-Notes:
- - Run as root (raw socket + /proc watch)
- - Best-effort reassembly: works for many simple TCP streams (HTTP, DNS over TCP)
+ - DNS parsing (UDP/TCP) -> show domain qnames
+ - Export JSON/CSV files (--export-json / --export-csv)
+ - Export to syslog/journalctl in JSON format (--syslog)
+ - --no-ui : plain text stdout (suitable for tee)
+ - --background-log : silent capture, only export (no outputs)
 """
 
+from collections import deque, defaultdict, Counter, namedtuple
+import argparse
+import ctypes
+import csv
+import errno
+import json
+import logging
+import logging.handlers
 import os
-import sys
+import re
+import signal
 import socket
 import struct
+import sys
 import threading
 import time
 import curses
-from collections import deque, defaultdict, Counter, namedtuple
-import argparse
-import signal
-import re
-import json
-import csv
-import ctypes
-import errno
 
 # ---------- Config ----------
 MAX_RECENT = 400
-REFRESH_CONN = 2.0      # polling fallback interval
+REFRESH_CONN = 2.0
 REFRESH_UI = 1.0
-INODE_TTL = 120.0       # seconds before an inode->pid mapping expires if not refreshed
-TCP_REASM_LIMIT = 10 * 1024 * 1024  # per-stream byte limit
+INODE_TTL = 120.0
+TCP_REASM_LIMIT = 10 * 1024 * 1024
 USE_INOTIFY = True
 # ----------------------------
 
 RUNNING = True
-
 def signal_handler(sig, frame):
     global RUNNING
     RUNNING = False
-
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
@@ -57,7 +57,7 @@ pid_seen = set()
 
 PacketInfo = namedtuple("PacketInfo", ["ts","proto","src","sport","dst","dport","size","pid","pname","info"])
 
-# ---------- /proc parsing helpers ----------
+# ---------- /proc helpers ----------
 def hex_to_ipv4(hexstr):
     try:
         b = bytes.fromhex(hexstr)
@@ -141,25 +141,20 @@ def scan_pid_fds(pid):
         pass
     return found
 
-# ---------- inode cache with TTL + incremental update ----------
+# ---------- inode cache (incremental) ----------
 def incremental_inode_pid_update():
     global inode2pid, pid_seen
     try:
         current_pids = {p for p in os.listdir("/proc") if p.isdigit()}
     except Exception:
         current_pids = set()
-
     added = current_pids - pid_seen
     removed = pid_seen - current_pids
-
-    # remove mappings for removed pids
     if removed:
         with inode2pid_lock:
             to_remove = [ino for ino,(pid,t) in inode2pid.items() if str(pid) in removed]
             for ino in to_remove:
                 inode2pid.pop(ino, None)
-
-    # scan new pids only
     for pid in added:
         scanned = scan_pid_fds(pid)
         if scanned:
@@ -184,7 +179,6 @@ def build_conn_map_from_cache():
         for ino,info in ino_map.items():
             rec = inode2pid.get(ino)
             pid = rec[0] if rec else None
-            # refresh last_seen for this inode
             if rec:
                 inode2pid[ino] = (rec[0], time.time())
             laddr = info.get("laddr"); lport = info.get("lport")
@@ -198,7 +192,7 @@ def build_conn_map_from_cache():
                 conn_map[rev] = pid
     return conn_map
 
-# ---------- attempt to use inotify via ctypes ----------
+# ---------- inotify via ctypes ----------
 has_inotify = False
 libc = None
 inotify_fd = None
@@ -216,12 +210,19 @@ def try_setup_inotify():
         if wd < 0:
             return False
         has_inotify = True
+        # set non-blocking
+        try:
+            import fcntl
+            flags = fcntl.fcntl(inotify_fd, fcntl.F_GETFL)
+            fcntl.fcntl(inotify_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        except Exception:
+            pass
         return True
     except Exception:
         has_inotify = False
         return False
 
-# ---------- packet parsing (ethernet, ip, tcp, udp, icmp, arp) ----------
+# ---------- packet parsing ----------
 def parse_ethernet(frame):
     if len(frame) < 14: return None, None, None
     ethertype = struct.unpack("!H", frame[12:14])[0]
@@ -271,27 +272,30 @@ def parse_arp(data):
 
 # ---------- DNS parsing ----------
 def decode_dns_name(buf, offset):
-    labels=[]; orig_off = offset; jumped=False; max_steps=256; steps=0
+    labels=[]; jumped=False; max_steps=256; steps=0
+    orig_after = None
     while True:
         if offset>=len(buf): return ("", offset+1)
         length = buf[offset]
         if length & 0xC0 == 0xC0:
             if offset+1>=len(buf): return ("", offset+2)
             ptr = ((length & 0x3F)<<8) | buf[offset+1]
-            if not jumped:
-                after = offset+2; jumped=True
-            offset = ptr; steps+=1
-            if steps>max_steps: return ("", after if jumped else offset)
+            if orig_after is None:
+                orig_after = offset+2
+            offset = ptr
+            steps += 1
+            if steps>max_steps:
+                return ("", orig_after or offset)
             continue
         if length==0:
-            offset+=1; break
+            offset+=1
+            break
         offset+=1
         if offset+length>len(buf): return ("", offset+length)
         labels.append(buf[offset:offset+length].decode(errors="ignore"))
         offset+=length
     name = ".".join([l for l in labels if l])
-    if jumped: return (name, after)
-    return (name, offset)
+    return (name, orig_after or offset)
 
 def parse_dns_from_payload(payload, is_tcp=False):
     qnames=[]
@@ -311,13 +315,14 @@ def parse_dns_from_payload(payload, is_tcp=False):
         for _ in range(qdcount):
             name, offset = decode_dns_name(payload2, offset)
             if offset+4<=len(payload2):
-                offset+=4
-            if name: qnames.append(name)
+                offset += 4
+            if name:
+                qnames.append(name)
         return qnames
     except Exception:
         return qnames
 
-# ---------- TCP reassembly (basic) ----------
+# ---------- TCP reassembly ----------
 tcp_streams = {}
 tcp_lock = threading.Lock()
 
@@ -340,11 +345,9 @@ def add_tcp_segment(src, sport, dst, dport, seq, payload):
             entry = {"a_to_b":{}, "b_to_a":{}, "a_id":(key[0],int(key[1]) if key[1] else 0), "b_id":(key[2],int(key[3]) if key[3] else 0), "assembled_a":b"", "assembled_b":b""}
             tcp_streams[key] = entry
         if dir_flag == entry["a_id"]:
-            bag = entry["a_to_b"]
-            side = "a"
+            bag = entry["a_to_b"]; side = "a"
         else:
-            bag = entry["b_to_a"]
-            side = "b"
+            bag = entry["b_to_a"]; side = "b"
         if len(b"".join(bag.values())) + len(payload) > TCP_REASM_LIMIT:
             bag.clear()
         if seq not in bag:
@@ -355,13 +358,11 @@ def add_tcp_segment(src, sport, dst, dport, seq, payload):
             cur = seqs[0]
             for s in seqs:
                 if s == cur:
-                    assembled_chunks.append(bag[s])
-                    cur = s + len(bag[s])
+                    assembled_chunks.append(bag[s]); cur = s + len(bag[s])
                 elif s < cur:
                     off = cur - s
                     if off < len(bag[s]):
-                        assembled_chunks.append(bag[s][off:])
-                        cur = s + len(bag[s])
+                        assembled_chunks.append(bag[s][off:]); cur = s + len(bag[s])
                 else:
                     break
             assembled = b"".join(assembled_chunks)
@@ -379,38 +380,103 @@ def add_tcp_segment(src, sport, dst, dport, seq, payload):
             pass
     return None
 
-# ---------- Exporter classes ----------
+# ---------- Exporters ----------
 class Exporter:
     def __init__(self, json_path=None, csv_path=None):
-        self.json_path=json_path; self.csv_path=csv_path; self.lock=threading.Lock()
-        self.csv_header_done=False
+        self.json_path = json_path
+        self.csv_path = csv_path
+        self.lock = threading.Lock()
+        self.csv_header_done = False
         if self.csv_path:
             try:
-                self.csv_header_done = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path)>0
+                self.csv_header_done = os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0
             except Exception:
-                self.csv_header_done=False
-    def write(self, pkt):
-        d = {"time":time.strftime("%Y-%m-%dT%H:%M:%S",time.localtime(pkt.ts)),"proto":pkt.proto,"src":pkt.src,"sport":pkt.sport,"dst":pkt.dst,"dport":pkt.dport,"size":pkt.size,"pid":pkt.pid,"pname":pkt.pname,"info":pkt.info}
+                self.csv_header_done = False
+
+    def write(self, pkt: PacketInfo):
+        d = {
+            "ts": pkt.ts,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(pkt.ts)),
+            "proto": pkt.proto,
+            "src": pkt.src,
+            "sport": pkt.sport,
+            "dst": pkt.dst,
+            "dport": pkt.dport,
+            "size": pkt.size,
+            "pid": pkt.pid,
+            "pname": pkt.pname,
+            "info": pkt.info
+        }
         if self.json_path:
             try:
                 with self.lock:
-                    with open(self.json_path,"a",encoding="utf-8") as jf:
-                        jf.write(json.dumps(d,ensure_ascii=False)+"\n")
+                    with open(self.json_path, "a", encoding="utf-8") as jf:
+                        jf.write(json.dumps(d, ensure_ascii=False) + "\n")
             except Exception:
                 pass
         if self.csv_path:
             try:
                 with self.lock:
                     write_header = not self.csv_header_done
-                    with open(self.csv_path,"a",newline="",encoding="utf-8") as cf:
+                    with open(self.csv_path, "a", newline="", encoding="utf-8") as cf:
                         writer = csv.DictWriter(cf, fieldnames=["time","proto","src","sport","dst","dport","size","pid","pname","info"])
                         if write_header:
-                            writer.writeheader(); self.csv_header_done=True
-                        writer.writerow(d)
+                            writer.writeheader(); self.csv_header_done = True
+                        row = {k: d.get(k) for k in writer.fieldnames}
+                        writer.writerow(row)
             except Exception:
                 pass
 
-# ---------- packet sniffer (raw socket) ----------
+class SyslogExporter:
+    """
+    Send JSON-formatted log messages to local syslog (/dev/log).
+    The message is the JSON string; use journalctl -t <ident> to view.
+    """
+    def __init__(self, ident="netmon"):
+        self.ident = ident
+        self.logger = logging.getLogger(ident)
+        self.logger.setLevel(logging.INFO)
+        self.enabled = False
+        try:
+            handler = logging.handlers.SysLogHandler(address='/dev/log')
+            # Keep the message as-is (we emit JSON in msg)
+            formatter = logging.Formatter('%(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.enabled = True
+        except Exception:
+            # Fallback to UDP syslog (localhost:514) if /dev/log not available
+            try:
+                handler = logging.handlers.SysLogHandler(address=('127.0.0.1', 514))
+                handler.setFormatter(logging.Formatter('%(message)s'))
+                self.logger.addHandler(handler)
+                self.enabled = True
+            except Exception:
+                self.enabled = False
+
+    def write(self, pkt: PacketInfo):
+        if not self.enabled:
+            return
+        d = {
+            "ts": pkt.ts,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(pkt.ts)),
+            "proto": pkt.proto,
+            "src": pkt.src,
+            "sport": pkt.sport,
+            "dst": pkt.dst,
+            "dport": pkt.dport,
+            "size": pkt.size,
+            "pid": pkt.pid,
+            "pname": pkt.pname,
+            "info": pkt.info
+        }
+        try:
+            # send JSON string as message
+            self.logger.info(json.dumps(d, ensure_ascii=False))
+        except Exception:
+            pass
+
+# ---------- Packet handling ----------
 def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter, packets_deque, stats, exporter):
     ts = time.time(); size = len(raw_frame)
     ethertype, payload, _ = parse_ethernet(raw_frame)
@@ -451,7 +517,7 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
         else:
             proto_name=f"ip/{ip['proto']}"
     elif ethertype==0x86DD:
-        ip6 = parse_ipv6(payload); 
+        ip6 = parse_ipv6(payload)
         if not ip6: return
         src=ip6["src"]; dst=ip6["dst"]; proto_name=f"ipv6/{ip6['proto']}"
     elif ethertype==0x0806:
@@ -473,7 +539,7 @@ def parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter
         except Exception:
             pass
 
-    # mapping to pid
+    # map to pid
     pid=None; pname=None
     conn_map = conn_map_getter()
     key = (src, sport, dst, dport, "tcp" if proto_name=="tcp" else ("udp" if proto_name=="udp" else None))
@@ -526,10 +592,12 @@ def packet_sniffer_thread(filter_proto, filter_port, packets_deque, stats, conn_
             parse_frame_and_handle(raw_frame, filter_proto, filter_port, conn_map_getter, packets_deque, stats, exporter)
         except Exception:
             continue
-    try: sock.close()
-    except: pass
+    try:
+        sock.close()
+    except Exception:
+        pass
 
-# ---------- conn refresher with inotify fallback ----------
+# ---------- conn refresher ----------
 def conn_refresher(holder):
     inited = False
     if USE_INOTIFY:
@@ -544,7 +612,7 @@ def conn_refresher(holder):
     if inited and has_inotify:
         while RUNNING:
             try:
-                data = os.read(inotify_fd, BUF_LEN)
+                _ = os.read(inotify_fd, BUF_LEN)
                 incremental_inode_pid_update()
                 expire_inode_entries()
                 holder[0] = build_conn_map_from_cache()
@@ -563,12 +631,8 @@ def conn_refresher(holder):
             holder[0] = build_conn_map_from_cache()
             time.sleep(REFRESH_CONN)
 
-# ---------- Text console logger (no-ui mode) ----------
+# ---------- console logger ----------
 def console_logger(packets_deque, stats):
-    """
-    Print human-readable lines to stdout. Suitable for piping / tee.
-    Consumes packets from deque (popleft) to avoid UI-only duplication.
-    """
     try:
         while RUNNING:
             try:
@@ -582,12 +646,11 @@ def console_logger(packets_deque, stats):
             pid_part = f"{pkt.pid}/{pkt.pname}" if pkt.pid else "-"
             info_part = f" {pkt.info}" if pkt.info else ""
             line = f"[{t}] {pkt.proto.upper():5} {pkt.src}{src_port} -> {pkt.dst}{dst_port} {pkt.size}B PID={pid_part}{info_part}"
-            # print plain text, flush immediately
             print(line, flush=True)
     except KeyboardInterrupt:
         pass
 
-# ---------- Curses UI ----------
+# ---------- curses UI ----------
 def ui(stdscr, packets, stats, conn_map_holder):
     curses.use_default_colors()
     stdscr.nodelay(True)
@@ -597,7 +660,7 @@ def ui(stdscr, packets, stats, conn_map_holder):
         if now - last >= REFRESH_UI:
             stdscr.erase()
             h,w = stdscr.getmaxyx()
-            stdscr.addstr(0,0,"Network Monitor (v2) — TCP reassembly + inode TTL + inotify fallback — Ctrl-C to quit")
+            stdscr.addstr(0,0,"Network Monitor (v2) — JSON syslog + background logging — Ctrl-C to quit")
             stdscr.addstr(1,0,f"Pkts: {stats['total_pkts']}  Bytes: {stats['total_bytes']}  Conn map: {len(conn_map_holder[0])}")
             stdscr.addstr(2,0,"-"*(w-1))
             stdscr.addstr(3,0,"Top processes by bytes")
@@ -631,12 +694,11 @@ def main():
     parser = argparse.ArgumentParser(description="Network monitor no deps v2")
     parser.add_argument("--proto", default=None)
     parser.add_argument("--port", default=None)
-    parser.add_argument("--export-json", default=None)
-    parser.add_argument("--export-csv", default=None)
+    parser.add_argument("--export-json", default=None, help="Append JSONL to this file")
+    parser.add_argument("--export-csv", default=None, help="Append CSV to this file")
     parser.add_argument("--no-ui", action="store_true", help="Disable curses UI and print plain text lines (suitable for tee/logging)")
-    parser.add_argument(
-        "--background-log", action="store_true",
-        help="Capture silencieuse (aucun affichage, écrit uniquement dans les fichiers de logs)")
+    parser.add_argument("--background-log", action="store_true", help="Silent capture: no output, only export")
+    parser.add_argument("--syslog", action="store_true", help="Send JSON logs to syslog/journal (JSON messages)")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -645,27 +707,46 @@ def main():
 
     packets = deque(maxlen=MAX_RECENT)
     stats = {"total_pkts":0,"total_bytes":0,"by_pid_bytes":defaultdict(int),"by_pid_pkts":defaultdict(int)}
+
+    # init cache & conn holder
     incremental_inode_pid_update()
     conn_holder = [build_conn_map_from_cache()]
-    exporter = None
-    if args.export_json or args.export_csv:
-        exporter = Exporter(json_path=args.export_json, csv_path=args.export_csv)
 
+    # choose exporter chain (you can have file exporter + syslog exporter)
+    exporters = []
+    file_exporter = None
+    syslog_exporter = None
+    if args.export_json or args.export_csv:
+        file_exporter = Exporter(json_path=args.export_json, csv_path=args.export_csv)
+        exporters.append(file_exporter)
+    if args.syslog:
+        syslog_exporter = SyslogExporter()
+        # only append if enabled
+        if syslog_exporter.enabled:
+            exporters.append(syslog_exporter)
+
+    # chain exporter wrapper
+    def exporter_write(pkt):
+        for ex in exporters:
+            try:
+                ex.write(pkt)
+            except Exception:
+                pass
+
+    # start threads
     t_conn = threading.Thread(target=conn_refresher, args=(conn_holder,), daemon=True)
     t_conn.start()
-    t_sniff = threading.Thread(target=packet_sniffer_thread, args=(args.proto, args.port, packets, stats, lambda: conn_holder[0], exporter), daemon=True)
+    t_sniff = threading.Thread(target=packet_sniffer_thread, args=(args.proto, args.port, packets, stats, lambda: conn_holder[0], type("E",(),{"write":exporter_write})()), daemon=True)
     t_sniff.start()
 
     try:
         if args.background_log:
-            # Mode silencieux : aucune sortie, capture en arrière-plan uniquement
+            # silent: just run until signal. Exporters write from sniffer.
             while RUNNING:
                 time.sleep(1)
         elif args.no_ui:
-            # Mode console : affichage texte dans le terminal
             console_logger(packets, stats)
         else:
-            # Mode interface curses
             curses.wrapper(ui, packets, stats, conn_holder)
     except Exception as e:
         print("UI/Runtime error:", e, file=sys.stderr)
