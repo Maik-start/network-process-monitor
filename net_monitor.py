@@ -634,6 +634,9 @@ def main():
     parser.add_argument("--export-json", default=None)
     parser.add_argument("--export-csv", default=None)
     parser.add_argument("--no-ui", action="store_true", help="Disable curses UI and print plain text lines (suitable for tee/logging)")
+    parser.add_argument(
+        "--background-log", action="store_true",
+        help="Capture silencieuse (aucun affichage, écrit uniquement dans les fichiers de logs)")
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -654,13 +657,17 @@ def main():
     t_sniff.start()
 
     try:
-        if args.no_ui:
-            # start console logger in main thread (so prints go to stdout nicely)
+        if args.background_log:
+            # Mode silencieux : aucune sortie, capture en arrière-plan uniquement
+            while RUNNING:
+                time.sleep(1)
+        elif args.no_ui:
+            # Mode console : affichage texte dans le terminal
             console_logger(packets, stats)
         else:
+            # Mode interface curses
             curses.wrapper(ui, packets, stats, conn_holder)
     except Exception as e:
-        # In no-ui mode, exceptions still should be printed plainly
         print("UI/Runtime error:", e, file=sys.stderr)
 
     time.sleep(0.2)
