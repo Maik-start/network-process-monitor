@@ -10,7 +10,9 @@
 
 💾 Export des logs au format CSV et JSON
 
-🚀 Cache PID intelligent : détection incrémentale des nouveaux processus
+🚀 Cache PID intelligent : détection incrémentale des nouveaux processus<img width="1062" height="651" alt="Capture d’écran du 2025-10-28 12-24-55" src="https://github.com/user-attachments/assets/a78fa870-797d-4e3c-8388-0693d9dbe509" /><img width="1062" height="651" alt="Capture d’écran du 2025-10-28 12-24-55" src="https://github.com/user-attachments/assets/3607fe0e-1f58-4e97-8b87-95d47b5ae03e" />
+
+
 
 🖥️ Interface CLI dynamique (type “nethogs”) rafraîchie en continu
 
